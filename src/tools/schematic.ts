@@ -865,7 +865,7 @@ edit_schematic_component and set its value to an empty string.`,
         }
         const lines = comps.map(
           (c: any) =>
-            `  ${c.reference}: ${c.libId} = "${c.value}" at (${c.position.x}, ${c.position.y}) rot=${c.rotation}°${c.pins ? ` [${c.pins.length} pins]` : ""}`,
+            `  ${c.reference}: ${c.libId} = "${c.value}" at (${c.position.x}, ${c.position.y}) rot=${c.rotation}°${c.mirror ? ` mirror=${c.mirror}` : ""}${c.pins ? ` [${c.pins.length} pins]` : ""}`,
         );
         return {
           content: [
@@ -931,7 +931,7 @@ edit_schematic_component and set its value to an empty string.`,
   // List all wires in schematic
   server.tool(
     "list_schematic_wires",
-    "List all wires in the schematic with start/end coordinates.",
+    "List all wires in the schematic. Each wire is reported as a sequence of waypoint coordinates; a straight segment has two waypoints, while a polyline wire exposes every intermediate bend so nothing is lost.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
     },
@@ -944,9 +944,14 @@ edit_schematic_component and set its value to an empty string.`,
             content: [{ type: "text", text: "No wires found in schematic." }],
           };
         }
-        const lines = wires.map(
-          (w: any) => `  (${w.start.x}, ${w.start.y}) → (${w.end.x}, ${w.end.y})`,
-        );
+        const lines = wires.map((w: any) => {
+          // Prefer the full waypoint list so bends in polyline wires are preserved.
+          // Fall back to start/end for backward compatibility with older payloads.
+          const pts: Array<{ x: number; y: number }> =
+            Array.isArray(w.points) && w.points.length >= 2 ? w.points : [w.start, w.end];
+          const rendered = pts.map((p) => `(${p.x}, ${p.y})`).join(" → ");
+          return `  ${rendered}`;
+        });
         return {
           content: [
             {

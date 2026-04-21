@@ -202,6 +202,79 @@ class PinLocator:
 
         return (rotated_x, rotated_y)
 
+    # @GeneratedBy:AI
+    @staticmethod
+    def read_symbol_mirror(target_symbol: Any) -> Tuple[bool, bool]:
+        """
+        Read the (mirror x|y) clause from a kicad-skip Symbol instance.
+
+        The ``skip`` library only exposes ``.mirror`` when the S-expression
+        actually contains a mirror clause, so we must guard with ``hasattr``
+        first. The value type is not strictly guaranteed across skip versions
+        (can be str / sexpdata.Symbol / list), so we normalise to a lowercase
+        string before comparing.
+
+        Args:
+            target_symbol: A placed symbol object from ``Schematic.symbol``.
+
+        Returns:
+            (mirror_x, mirror_y): Booleans matching the sexp axis tokens.
+            ``mirror_x`` means the symbol has ``(mirror x)`` which flips the
+            local X axis; ``mirror_y`` flips the local Y axis. This matches
+            the convention already used by ``WireDragger.pin_world_xy``.
+        """
+        if not hasattr(target_symbol, "mirror"):
+            return False, False
+
+        try:
+            raw = target_symbol.mirror.value
+        except Exception:
+            return False, False
+
+        if isinstance(raw, list) and raw:
+            raw = raw[0]
+
+        axis = str(raw).strip("\"'").lower()
+        return axis == "x", axis == "y"
+
+    # @GeneratedBy:AI
+    @staticmethod
+    def apply_symbol_transform(
+        px: float,
+        py: float,
+        sym_x: float,
+        sym_y: float,
+        rotation: float,
+        mirror_x: bool,
+        mirror_y: bool,
+    ) -> Tuple[float, float]:
+        """
+        Transform a pin's local coordinate into world (schematic) coordinates.
+
+        KiCAD applies transforms in the order: mirror (in local space) →
+        rotate → translate. This function is intentionally equivalent to
+        ``WireDragger.pin_world_xy`` so wire dragging and pin location lookup
+        agree on where a pin ends up — which was the root cause of the
+        "mirrored component pin positions are off by a reflection" bug.
+
+        Args:
+            px, py: Pin position in the library symbol's local frame.
+            sym_x, sym_y: Placed symbol origin in schematic coordinates.
+            rotation: Symbol rotation in degrees (CCW).
+            mirror_x: True when the symbol has ``(mirror x)`` — flip local X.
+            mirror_y: True when the symbol has ``(mirror y)`` — flip local Y.
+
+        Returns:
+            (abs_x, abs_y) in schematic world coordinates.
+        """
+        lx, ly = px, py
+        if mirror_x:
+            lx = -lx
+        if mirror_y:
+            ly = -ly
+        rx, ry = PinLocator.rotate_point(lx, ly, rotation)
+        return sym_x + rx, sym_y + ry
+
     def _get_lib_id(self, schematic_path: Path, symbol_reference: str) -> Optional[str]:
         """Helper: return the lib_id string for a placed symbol"""
         try:
@@ -242,6 +315,7 @@ class PinLocator:
 
             symbol_at = target_symbol.at.value
             symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
+            mirror_x, mirror_y = PinLocator.read_symbol_mirror(target_symbol)
 
             lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
             if not lib_id:
@@ -258,26 +332,17 @@ class PinLocator:
                 else:
                     return None
 
-            mirror_x = False
-            mirror_y = False
-            if hasattr(target_symbol, "mirror"):
-                mirror_val = (
-                    str(target_symbol.mirror.value)
-                    if hasattr(target_symbol.mirror, "value")
-                    else ""
-                )
-                if mirror_val == "x":
-                    mirror_x = True
-                elif mirror_val == "y":
-                    mirror_y = True
-
-            pin_def_angle = pins[pin_number].get("angle", 0)
-            # Y-negate flips the angle across the x-axis
-            pin_def_angle = (360 - pin_def_angle) % 360
+            # Mirror flips the pin's direction vector in local space before
+            # rotation is applied:
+            #   (mirror x) flips local X → θ becomes (180 - θ)
+            #   (mirror y) flips local Y → θ becomes -θ
+            # Then the placed symbol's rotation is added, giving the absolute
+            # outward direction in schematic coordinates.
+            pin_def_angle = float(pins[pin_number].get("angle", 0))
             if mirror_x:
-                pin_def_angle = (360 - pin_def_angle) % 360
+                pin_def_angle = (180.0 - pin_def_angle) % 360
             if mirror_y:
-                pin_def_angle = (180 - pin_def_angle) % 360
+                pin_def_angle = (-pin_def_angle) % 360
             absolute_angle = (pin_def_angle + symbol_rotation) % 360
             return absolute_angle
 
@@ -324,19 +389,7 @@ class PinLocator:
             symbol_x = float(symbol_at[0])
             symbol_y = float(symbol_at[1])
             symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
-
-            mirror_x = False
-            mirror_y = False
-            if hasattr(target_symbol, "mirror"):
-                mirror_val = (
-                    str(target_symbol.mirror.value)
-                    if hasattr(target_symbol.mirror, "value")
-                    else ""
-                )
-                if mirror_val == "x":
-                    mirror_x = True
-                elif mirror_val == "y":
-                    mirror_y = True
+            mirror_x, mirror_y = PinLocator.read_symbol_mirror(target_symbol)
 
             # Get symbol lib_id
             lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
@@ -345,8 +398,8 @@ class PinLocator:
                 return None
 
             logger.debug(
-                f"Symbol {symbol_reference}: pos=({symbol_x}, {symbol_y}), rot={symbol_rotation}, "
-                f"mirror_x={mirror_x}, mirror_y={mirror_y}, lib_id={lib_id}"
+                f"Symbol {symbol_reference}: pos=({symbol_x}, {symbol_y}), "
+                f"rot={symbol_rotation}, mirror=(x={mirror_x}, y={mirror_y}), lib_id={lib_id}"
             )
 
             # Get pin definitions for this symbol
@@ -376,33 +429,19 @@ class PinLocator:
 
             pin_data = pins[pin_number]
 
-            # Get pin position relative to symbol origin.
-            # lib_symbols uses library y-up convention; schematic uses y-down.
-            # Negate y here before rotation, matching KiCad's transform order.
-            pin_rel_x = pin_data["x"]
-            pin_rel_y = -pin_data["y"]
-
-            logger.debug(f"Pin {pin_number} relative position: ({pin_rel_x}, {pin_rel_y})")
-
-            # lib_symbols uses y-up; schematic uses y-down
-            pin_rel_y = -pin_rel_y
-
-            # Mirror in local coords after y-negate (KiCad transform order)
-            # mirror_x = flip across X axis → negate y
-            # mirror_y = flip across Y axis → negate x
-            if mirror_x:
-                pin_rel_y = -pin_rel_y
-            if mirror_y:
-                pin_rel_x = -pin_rel_x
-
-            # Apply symbol rotation to pin position
-            if symbol_rotation != 0:
-                pin_rel_x, pin_rel_y = self.rotate_point(pin_rel_x, pin_rel_y, symbol_rotation)
-                logger.debug(f"After transform (y-neg/mirror/rot): ({pin_rel_x}, {pin_rel_y})")
-
-            # Calculate absolute position
-            abs_x = symbol_x + pin_rel_x
-            abs_y = symbol_y + pin_rel_y
+            # Apply the full transform: mirror (local) → rotate → translate.
+            # Skipping the mirror step used to silently produce pin coordinates
+            # reflected across the symbol's origin for any symbol carrying
+            # (mirror x|y) — most commonly connectors like J1.
+            abs_x, abs_y = PinLocator.apply_symbol_transform(
+                pin_data["x"],
+                pin_data["y"],
+                symbol_x,
+                symbol_y,
+                symbol_rotation,
+                mirror_x,
+                mirror_y,
+            )
 
             logger.info(f"Pin {symbol_reference}/{pin_number} located at ({abs_x}, {abs_y})")
             return [abs_x, abs_y]

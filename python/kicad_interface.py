@@ -1426,6 +1426,18 @@ class KiCADInterface:
             else:
                 comp_pos = None
 
+            # Extract the optional (mirror x|y) clause. Scan only the symbol
+            # header (before the first nested (property ...) block) so we
+            # don't pick up a mirror clause belonging to a property or
+            # nested sub-symbol. Missing this field was causing the reported
+            # "component position off by a reflection" bug for mirrored parts.
+            header_end = block_text.find("(property")
+            header = block_text[:header_end] if header_end != -1 else block_text
+            mirror_match = re.search(r"\(mirror\s+([xy])\s*\)", header)
+            mirror_val: Optional[str] = mirror_match.group(1) if mirror_match else None
+            if comp_pos is not None:
+                comp_pos["mirror"] = mirror_val
+
             # Extract all properties with their at positions
             prop_pattern = re.compile(
                 r'\(property\s+"([^"]*)"\s+"([^"]*)"\s+\(at\s+([\d\.\-]+)\s+([\d\.\-]+)\s+([\d\.\-]+)\s*\)'
@@ -2248,6 +2260,15 @@ class KiCADInterface:
                 position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
                 uuid_val = symbol.uuid.value if hasattr(symbol, "uuid") else ""
 
+                # Read (mirror x|y) — independent from rotation. Without this,
+                # downstream callers that try to recreate a schematic cannot
+                # distinguish a mirrored component from a non-mirrored one,
+                # producing pin positions reflected across the symbol origin.
+                mirror_x, mirror_y = PinLocator.read_symbol_mirror(symbol)
+                mirror_val: Optional[str] = (
+                    "x" if mirror_x else ("y" if mirror_y else None)
+                )
+
                 comp = {
                     "reference": ref,
                     "libId": lib_id,
@@ -2255,6 +2276,7 @@ class KiCADInterface:
                     "footprint": footprint,
                     "position": {"x": float(position[0]), "y": float(position[1])},
                     "rotation": float(position[2]) if len(position) > 2 else 0,
+                    "mirror": mirror_val,
                     "uuid": str(uuid_val),
                 }
 
@@ -2408,11 +2430,17 @@ class KiCADInterface:
                                     }
                                 )
 
+                        # A wire may carry more than two points (e.g. a polyline
+                        # stored as a single element, or kicad-skip grouping
+                        # collinear segments). Preserve all waypoints so callers
+                        # can recover intermediate bends instead of only the
+                        # first/last point.
                         if len(points) >= 2:
                             wires.append(
                                 {
                                     "start": points[0],
                                     "end": points[-1],
+                                    "points": points,
                                 }
                             )
 

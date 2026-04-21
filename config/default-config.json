@@ -4,6 +4,6 @@
   "description": "MCP server for KiCAD PCB design operations",
   "pythonPath": "",
   "kicadPath": "",
-  "logLevel": "info",
+  "logLevel": "debug",
   "logDir": ""
 }
