@@ -33,6 +33,41 @@ class DynamicSymbolLoader:
         self.symbol_cache = {}  # Cache: "lib:symbol" -> raw text block
         self.project_path = project_path  # Project directory for project-specific libraries
 
+    # @GeneratedBy:AI
+    @staticmethod
+    def _derive_project_name(
+        schematic_path: Path, project_path: Optional[Path] = None
+    ) -> str:
+        """Determine the KiCad project name used in the ``(instances (project "...")`` block.
+
+        KiCad 6+ schematics match the reference designator shown in the GUI by looking
+        up ``(instances (project "<name>") ...)`` where ``<name>`` must equal the
+        project's ``.kicad_pro`` filename stem. If no match is found, KiCad falls back
+        to the library default (``R``, ``#PWR``, ...) and appends ``?`` – hence ``R?``.
+
+        Resolution order:
+          1. A ``*.kicad_pro`` file inside ``project_path`` (most authoritative).
+          2. A ``*.kicad_pro`` file next to ``schematic_path``.
+          3. ``schematic_path.stem`` as a last-resort fallback.
+        """
+        search_dirs: List[Path] = []
+        if project_path is not None:
+            search_dirs.append(Path(project_path))
+        if schematic_path is not None:
+            search_dirs.append(Path(schematic_path).parent)
+
+        for directory in search_dirs:
+            try:
+                if not directory.exists() or not directory.is_dir():
+                    continue
+                pro_files = sorted(directory.glob("*.kicad_pro"))
+                if pro_files:
+                    return pro_files[0].stem
+            except OSError as exc:
+                logger.debug(f"Project name probe failed for {directory}: {exc}")
+
+        return Path(schematic_path).stem
+
     def find_kicad_symbol_libraries(self) -> List[Path]:
         """Find all KiCad symbol library directories"""
         possible_paths = [
@@ -392,6 +427,7 @@ class DynamicSymbolLoader:
         logger.info(f"Injected symbol {full_name} into {sch_name}")
         return True
 
+    # @GeneratedBy:AI
     def create_component_instance(
         self,
         schematic_path: Path,
@@ -403,14 +439,23 @@ class DynamicSymbolLoader:
         x: float = 0,
         y: float = 0,
         unit: int = 1,
+        project_name: Optional[str] = None,
     ) -> bool:
         """
         Add a component instance to the schematic.
         This creates the (symbol ...) block with lib_id reference.
         For multi-unit symbols, set unit to 1–N to place a specific unit.
+
+        ``project_name`` MUST match the current project's ``.kicad_pro`` stem so KiCad
+        can resolve the real reference designator via the ``(instances ...)`` lookup.
+        When ``None``, it is derived from ``schematic_path`` / ``self.project_path``
+        using :meth:`_derive_project_name`. Passing the legacy literal ``"project"``
+        here will reproduce the historic bug that displays ``R?`` / ``#PWR?`` in the GUI.
         """
         full_lib_id = f"{library_name}:{symbol_name}"
         new_uuid = str(uuid.uuid4())
+        if project_name is None:
+            project_name = self._derive_project_name(schematic_path, self.project_path)
 
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit {unit})
     (in_bom yes) (on_board yes) (dnp no)
@@ -428,7 +473,7 @@ class DynamicSymbolLoader:
       (effects (font (size 1.27 1.27)) (hide yes))
     )
     (instances
-      (project "project"
+      (project "{project_name}"
         (path "/"
           (reference "{reference}")
           (unit {unit})
@@ -455,12 +500,22 @@ class DynamicSymbolLoader:
         logger.info(f"Added component instance {reference} ({full_lib_id}) at ({x}, {y})")
         return True
 
+    # @GeneratedBy:AI
     def load_symbol_dynamically(
-        self, schematic_path: Path, library_name: str, symbol_name: str
+        self,
+        schematic_path: Path,
+        library_name: str,
+        symbol_name: str,
+        project_name: Optional[str] = None,
     ) -> str:
         """
         Complete workflow: inject symbol definition and create a template instance.
         Returns a template reference name.
+
+        ``project_name`` is forwarded to :meth:`create_component_instance`. This
+        matters even for offscreen template instances: downstream code paths
+        (``ComponentManager.add_component``) clone this template and the cloned
+        ``(instances ...)`` block must already carry the correct project name.
         """
         logger.info(f"Loading symbol dynamically: {library_name}:{symbol_name}")
 
@@ -472,6 +527,9 @@ class DynamicSymbolLoader:
         sym_clean = symbol_name.replace("-", "_").replace(".", "_")
         template_ref = f"_TEMPLATE_{lib_clean}_{sym_clean}"
 
+        if project_name is None:
+            project_name = self._derive_project_name(schematic_path, self.project_path)
+
         self.create_component_instance(
             schematic_path,
             library_name,
@@ -480,11 +538,13 @@ class DynamicSymbolLoader:
             value=symbol_name,
             x=-200,
             y=-200,
+            project_name=project_name,
         )
 
         logger.info(f"Symbol loaded. Template reference: {template_ref}")
         return template_ref
 
+    # @GeneratedBy:AI
     def add_component(
         self,
         schematic_path: Path,
@@ -497,6 +557,7 @@ class DynamicSymbolLoader:
         y: float = 0,
         unit: int = 1,
         project_path: Optional[Path] = None,
+        project_name: Optional[str] = None,
     ) -> bool:
         """
         High-level: ensure symbol definition exists in schematic, then add an instance.
@@ -505,10 +566,18 @@ class DynamicSymbolLoader:
         Args:
             unit: For multi-unit symbols, which unit to place (1=A, 2=B, …). Default 1.
             project_path: Optional project directory. When set, project-specific
-                          sym-lib-table is also searched for the library file.
+                          sym-lib-table is also searched for the library file, and
+                          the directory is also probed for a ``*.kicad_pro`` to
+                          derive ``project_name`` when not given explicitly.
+            project_name: Optional override for the ``(instances (project "..."))``
+                          tag. Must match the ``.kicad_pro`` stem so KiCad displays
+                          the correct reference designator instead of ``R?``.
         """
         if project_path:
             self.project_path = project_path
+        if project_name is None:
+            project_name = self._derive_project_name(schematic_path, self.project_path)
+
         # Ensure symbol definition is in lib_symbols
         self.inject_symbol_into_schematic(schematic_path, library_name, symbol_name)
 
@@ -523,6 +592,7 @@ class DynamicSymbolLoader:
             x=x,
             y=y,
             unit=unit,
+            project_name=project_name,
         )
 
 
