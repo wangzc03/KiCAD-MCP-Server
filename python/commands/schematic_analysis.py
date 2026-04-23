@@ -59,6 +59,31 @@ def _parse_wires(sexp_data: list) -> List[Dict[str, Any]]:
     return wires
 
 
+# @GeneratedBy:AI
+def _parse_junctions(sexp_data: list) -> List[Tuple[float, float]]:
+    """
+    Parse all junction positions from the schematic S-expression.
+
+    Junction format: ``(junction (at x y) (diameter ...) (color ...) (uuid ...))``.
+    We only care about the ``(at x y)`` coordinate — the remaining attributes
+    (diameter/color/uuid) don't affect T-junction detection.
+
+    Returns a list of ``(x_mm, y_mm)`` tuples. Callers typically convert
+    these to KiCad internal units (10_000 IU/mm) for exact-equality lookup.
+    """
+    positions: List[Tuple[float, float]] = []
+    for item in sexp_data:
+        if not isinstance(item, list) or len(item) < 2:
+            continue
+        if item[0] != Symbol("junction"):
+            continue
+        for sub in item:
+            if isinstance(sub, list) and len(sub) >= 3 and sub[0] == Symbol("at"):
+                positions.append((float(sub[1]), float(sub[2])))
+                break
+    return positions
+
+
 def _parse_labels(sexp_data: list) -> List[Dict[str, Any]]:
     """
     Parse all labels (label and global_label) from the schematic S-expression.
@@ -551,6 +576,15 @@ def find_overlapping_elements(schematic_path: Path, tolerance: float = 0.5) -> D
             if overlap:
                 overlapping_wires.append(overlap)
 
+    # --- T-junction / missing-junction detection (phase A) ---
+    # Detects wire endpoints landing in the middle of another wire, plus
+    # ≥3-wire endpoint pile-ups, excluding any point already covered by
+    # an explicit junction dot. NOT counted in ``totalOverlaps`` to keep
+    # the pre-existing field backward-compatible; callers that want the
+    # new signal use ``tJunctions`` / ``tJunctionCount`` directly.
+    junctions = _parse_junctions(sexp_data)
+    t_junctions = _find_t_junctions(wires, junctions)
+
     total = len(overlapping_symbols) + len(overlapping_labels) + len(overlapping_wires)
 
     return {
@@ -558,6 +592,8 @@ def find_overlapping_elements(schematic_path: Path, tolerance: float = 0.5) -> D
         "overlappingLabels": overlapping_labels,
         "overlappingWires": overlapping_wires,
         "totalOverlaps": total,
+        "tJunctions": t_junctions,
+        "tJunctionCount": len(t_junctions),
     }
 
 
@@ -618,6 +654,198 @@ def _check_wire_overlap(
         }
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# T-junction detection helpers
+# ---------------------------------------------------------------------------
+
+
+# @GeneratedBy:AI
+def _point_strictly_on_orthogonal_segment(
+    px: float,
+    py: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    eps: float = 1e-6,
+) -> bool:
+    """
+    Return True iff ``(px, py)`` lies strictly between ``(x1, y1)`` and
+    ``(x2, y2)`` on a horizontal or vertical segment — i.e. the point is
+    on the segment but **not** at either endpoint.
+
+    This is the exact predicate needed for T-junction detection: a wire's
+    endpoint lands in the *middle* of another wire (KiCad does not
+    automatically connect such endpoints; they require an explicit
+    junction dot).
+
+    Duplicated from ``WireManager._point_strictly_on_wire`` to avoid a
+    cross-module dependency on that class's private helper. The two
+    implementations MUST stay behaviourally identical; if you change the
+    tolerance or extend to diagonal segments here, update the other one
+    too.
+
+    KiCad schematic wires are ~100% orthogonal in practice, so diagonal
+    segments are intentionally unsupported (returns False) — same as the
+    wire_manager helper.
+    """
+    if abs(y1 - y2) < eps:  # horizontal segment
+        if abs(py - y1) > eps:
+            return False
+        lo, hi = min(x1, x2), max(x1, x2)
+        return lo + eps < px < hi - eps
+    if abs(x1 - x2) < eps:  # vertical segment
+        if abs(px - x1) > eps:
+            return False
+        lo, hi = min(y1, y2), max(y1, y2)
+        return lo + eps < py < hi - eps
+    return False
+
+
+# @GeneratedBy:AI
+def _find_t_junctions(
+    wires: List[Dict[str, Any]],
+    junctions: List[Tuple[float, float]],
+) -> List[Dict[str, Any]]:
+    """
+    Detect wire-meeting points that need — but don't have — a junction dot.
+
+    Two sub-cases are reported under a single ``tJunctions`` field:
+
+    * ``t_junction`` — a wire's endpoint lands strictly in the middle of
+      another wire. In KiCad this does **not** create an electrical
+      connection automatically; the user needs an explicit junction dot.
+
+    * ``multi_wire_endpoint`` — three or more wire endpoints pile up at
+      the same coordinate. Two endpoints meeting is a simple corner /
+      extension and is fine without a junction, but ≥3 endpoints meeting
+      electrically *do* require a junction to disambiguate the split.
+
+    Deliberately NOT reported:
+
+    * ``X`` crossings where two wire mid-segments pass through a common
+      point with no endpoint involved. KiCad's own rule is "X does not
+      imply a connection", so flagging these would produce false
+      positives against intentional crossovers. (Noise vs coverage is
+      the classic tradeoff here; we err toward low-false-positive.)
+
+    Coordinate equality is done in KiCad internal units (``_to_iu``,
+    10 000 IU/mm) rather than raw mm, so residual floating-point noise
+    (e.g. the ``93.97999999`` rounding bug seen before ``rotate_point``
+    was made exact) doesn't cause us to miss points that are
+    algebraically the same.
+
+    Args:
+        wires: Wire list from ``_parse_wires`` — each dict has ``start``
+            and ``end`` ``(x_mm, y_mm)`` tuples.
+        junctions: Junction positions from ``_parse_junctions``.
+
+    Returns:
+        A list of dicts, one per offending point:
+
+        .. code-block:: python
+
+            {
+              "position": {"x": float, "y": float},  # mm, rounded to 4dp
+              "wires": [
+                {"start": {"x": ..., "y": ...}, "end": {...}},
+                ...
+              ],
+              "type": "t_junction" | "multi_wire_endpoint",
+            }
+    """
+    # IU set of positions that already have a junction — skip those.
+    anchor_iu: Set[Tuple[int, int]] = {_to_iu(jx, jy) for jx, jy in junctions}
+
+    # --- Pass 1: endpoints strictly inside another wire (classic T) ---
+    # Key = IU of the endpoint; value = { "pos_mm": (x,y), "wires": set(idx) }
+    t_points: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+    for i, w_i in enumerate(wires):
+        for endpoint_mm in (w_i["start"], w_i["end"]):
+            ep_iu = _to_iu(*endpoint_mm)
+            if ep_iu in anchor_iu:
+                continue  # user already placed a junction here
+
+            for j, w_j in enumerate(wires):
+                if i == j:
+                    continue
+                (x1, y1), (x2, y2) = w_j["start"], w_j["end"]
+                if _point_strictly_on_orthogonal_segment(
+                    endpoint_mm[0], endpoint_mm[1], x1, y1, x2, y2
+                ):
+                    entry = t_points.setdefault(
+                        ep_iu, {"pos_mm": endpoint_mm, "wires": set()}
+                    )
+                    entry["wires"].add(i)
+                    entry["wires"].add(j)
+
+    # --- Pass 2: multi-wire endpoint pile-ups (≥3 endpoints at same IU) ---
+    iu_to_endpoint_wires: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
+    for i, w_i in enumerate(wires):
+        iu_to_endpoint_wires[_to_iu(*w_i["start"])].add(i)
+        iu_to_endpoint_wires[_to_iu(*w_i["end"])].add(i)
+
+    multi_points: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for pt_iu, wire_idxs in iu_to_endpoint_wires.items():
+        if pt_iu in anchor_iu:
+            continue
+        if len(wire_idxs) < 3:
+            continue
+        # Recover a mm representative: pick the endpoint whose IU matches.
+        any_idx = next(iter(wire_idxs))
+        w = wires[any_idx]
+        ep_mm = w["start"] if _to_iu(*w["start"]) == pt_iu else w["end"]
+        multi_points[pt_iu] = {"pos_mm": ep_mm, "wires": set(wire_idxs)}
+
+    # --- Merge & emit ---
+    # If a point qualifies as BOTH (T with an endpoint + additional endpoints
+    # piling up there), we report it once as "t_junction" because that
+    # already implies the stronger "needs a junction" fix. The ``wires``
+    # list is unioned so no involved wire is lost.
+    results: List[Dict[str, Any]] = []
+
+    def _wires_payload(indices: Set[int]) -> List[Dict[str, Dict[str, float]]]:
+        return [
+            {
+                "start": {"x": wires[idx]["start"][0], "y": wires[idx]["start"][1]},
+                "end": {"x": wires[idx]["end"][0], "y": wires[idx]["end"][1]},
+            }
+            for idx in sorted(indices)
+        ]
+
+    for pt_iu, info in t_points.items():
+        wire_set = set(info["wires"])
+        if pt_iu in multi_points:
+            wire_set |= multi_points[pt_iu]["wires"]
+        results.append(
+            {
+                "position": {
+                    "x": round(info["pos_mm"][0], 4),
+                    "y": round(info["pos_mm"][1], 4),
+                },
+                "wires": _wires_payload(wire_set),
+                "type": "t_junction",
+            }
+        )
+
+    for pt_iu, info in multi_points.items():
+        if pt_iu in t_points:
+            continue  # already reported above
+        results.append(
+            {
+                "position": {
+                    "x": round(info["pos_mm"][0], 4),
+                    "y": round(info["pos_mm"][1], 4),
+                },
+                "wires": _wires_payload(info["wires"]),
+                "type": "multi_wire_endpoint",
+            }
+        )
+
+    return results
 
 
 # ---------------------------------------------------------------------------
