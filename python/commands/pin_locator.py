@@ -173,10 +173,23 @@ class PinLocator:
             logger.error(traceback.format_exc())
             return {}
 
+    # @GeneratedBy:AI
     @staticmethod
     def rotate_point(x: float, y: float, angle_degrees: float) -> Tuple[float, float]:
         """
-        Rotate a point around the origin
+        Rotate a point around the origin (counterclockwise).
+
+        KiCAD only ever places symbols at the four orthogonal rotations
+        (0/90/180/270), and pin coordinates must stay on the grid so that
+        wires endpoint-match exactly. Using ``math.cos``/``math.sin`` for
+        these angles introduces ~1e-16 floating-point noise (e.g.
+        ``math.cos(math.radians(90)) == 6.12e-17`` instead of 0), which then
+        propagates through ``apply_symbol_transform`` into saved wire
+        endpoints and causes spurious ERC "unconnected pin" errors.
+
+        We therefore special-case the four orthogonal rotations so the
+        result is algebraically exact, and fall back to the trig formula
+        only for non-orthogonal angles.
 
         Args:
             x: X coordinate
@@ -186,8 +199,15 @@ class PinLocator:
         Returns:
             (rotated_x, rotated_y)
         """
-        if angle_degrees == 0:
+        angle_mod = angle_degrees % 360
+        if angle_mod == 0:
             return (x, y)
+        if angle_mod == 90:
+            return (-y, x)
+        if angle_mod == 180:
+            return (-x, -y)
+        if angle_mod == 270:
+            return (y, -x)
 
         angle_rad = math.radians(angle_degrees)
         cos_a = math.cos(angle_rad)
@@ -273,7 +293,12 @@ class PinLocator:
         if mirror_y:
             ly = -ly
         rx, ry = PinLocator.rotate_point(lx, ly, rotation)
-        return sym_x + rx, sym_y + ry
+        # Belt-and-braces rounding: rotate_point now returns exact values
+        # for the orthogonal angles, but this guards any future non-
+        # orthogonal rotation (and the downstream addition) from leaking
+        # ~1e-16 noise into saved wire endpoints. 6 decimals is ~1 nm on
+        # a schematic grid, well below KiCAD's internal precision.
+        return round(sym_x + rx, 6), round(sym_y + ry, 6)
 
     def _get_lib_id(self, schematic_path: Path, symbol_reference: str) -> Optional[str]:
         """Helper: return the lib_id string for a placed symbol"""
