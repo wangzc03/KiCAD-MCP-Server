@@ -379,17 +379,34 @@ class PinLocator:
             #   lib y-up → schematic y-down      →   θ becomes -θ
             #   (mirror x) = reflect across X    →   θ becomes -θ     (flip Y)
             #   (mirror y) = reflect across Y    →   θ becomes 180-θ  (flip X)
-            #   + symbol rotation
-            # Derivation: direction vector (cos θ, sin θ).
+            #   + symbol rotation (SUBTRACTED — see note below)
+            # Derivation: direction vector (cos θ, sin θ) in the "0=right,
+            # 90=up (visual)" screen-angle convention used by get_pin_angle's
+            # consumers (see connection_schematic.stub_end: dy = -sin(θ)).
             #   flip Y → (cos θ, -sin θ) = (cos(-θ), sin(-θ)) → θ' = -θ
             #   flip X → (-cos θ, sin θ) = (cos(180-θ), sin(180-θ)) → θ' = 180-θ
+            #
+            # Rotation sign: apply_symbol_transform calls rotate_point(x,y,θ)
+            # which implements math-CCW rotation in a y-up frame, BUT that
+            # rotation is applied to already-y-negated (i.e. y-down) coords.
+            # In the y-down sch frame that same operation is visually
+            # CLOCKWISE. For a screen angle (0=right, 90=up visual), a
+            # visual-CW rotation by θ is θ' = (a - θ) mod 360 — hence the
+            # subtraction below. Writing "a + rotation" (the previous buggy
+            # form) over-rotates by 2·rotation in the wrong direction, so
+            # the bug only shows up once rotation ≠ 0 — pure-mirror cases
+            # coincidentally pass because rotation is 0. End-to-end
+            # reproduction: Device:R with (mirror x) + rotation=90, pin 1
+            # endpoint lands on the LEFT of the body but the old code
+            # reported outward=0 (right), producing a wire stub that
+            # threads through the resistor body.
             pin_def_angle = float(pins[pin_number].get("angle", 0))
             pin_def_angle = (360 - pin_def_angle) % 360
             if mirror_x:
                 pin_def_angle = (360 - pin_def_angle) % 360
             if mirror_y:
                 pin_def_angle = (180 - pin_def_angle) % 360
-            absolute_angle = (pin_def_angle + symbol_rotation) % 360
+            absolute_angle = (pin_def_angle - symbol_rotation) % 360
             return absolute_angle
 
         except Exception:

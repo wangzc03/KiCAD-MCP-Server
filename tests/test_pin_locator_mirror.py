@@ -163,17 +163,26 @@ class TestApplySymbolTransform:
 @pytest.mark.unit
 class TestGetPinAngleMirrorSemantics:
     """
-    Outward pin direction in SCHEMATIC (y-down) coordinates:
+    Outward pin direction in the SCREEN-angle convention used by
+    get_pin_angle's consumers (see connection_schematic.py, which does
+    ``stub_end_y = pin_y - 2.54 * sin(angle)`` — note the MINUS on the Y
+    component):
+
       0°   = right
-      90°  = down     (because schematic y increases downward)
+      90°  = up       (visually up on screen; y decreases in y-down sch)
       180° = left
-      270° = up
+      270° = down
 
     Pin angles stored in lib_symbols use the y-up convention, so we apply:
       y-negate  →  -angle
       mirror_x (reflect X, flip Y)  →  -angle
       mirror_y (reflect Y, flip X)  →  180 - angle
-      + symbol rotation
+      - symbol rotation                 # see note in get_pin_angle: the
+                                        # position-rotation matrix is math
+                                        # CCW in y-up applied to y-down
+                                        # coords, i.e. visually CW, so in
+                                        # the screen-angle convention the
+                                        # rotation is SUBTRACTED.
     """
 
     @pytest.fixture(autouse=True)
@@ -221,26 +230,79 @@ class TestGetPinAngleMirrorSemantics:
 
     def test_vertical_pin_angle90_with_mirror_x_becomes_down(self):
         """
-        Lib angle=90 means 'up' in lib y-up coords. In schematic y-down,
-        that direction (0, +1 in lib) becomes (0, -1) (going UP in schematic)
-        — angle 270. Apply (mirror x) (flip Y) to get (0, +1) in schematic
-        → angle 90 (DOWN in schematic).
+        Lib angle=90 means the outward direction points UP in the lib
+        y-up frame. y-negating flips that to DOWN on screen; applying
+        (mirror x) (which flips local Y) puts it back to UP on screen.
+
+        In the screen-angle convention used here (0=right, 90=up),
+        that outward direction is 90° (up).
 
         Walk-through with our formula:
           pin_def_angle = 90
-          y-negate: (360 - 90) = 270
-          mirror_x: (360 - 270) = 90
-          + rotation 0 = 90
+          y-negate: (360 - 90) = 270          # now 'down' in 90=up conv
+          mirror_x: (360 - 270) = 90          # flips back to 'up'
+          - rotation 0 = 90
         """
         sym = _stub_symbol_with_mirror("R1", at=[0.0, 0.0, 0.0], mirror_axis="x")
         angle = self._call(sym, {"x": 0.0, "y": 0.0, "angle": 90, "name": "~"})
         assert angle == 90.0
 
-    def test_symbol_rotation_is_additive(self):
+    def test_symbol_rotation_is_subtracted_in_screen_angle(self):
         """
-        No mirror, lib angle=0 → schematic 0; then symbol rotation 90° CCW
-        is simply added: expected 90.
+        No mirror, lib angle=0 (outward points right in lib y-up).
+        After y-negate in the "0=right, 90=up (visual)" convention the
+        outward is still 0 (right — horizontal direction is unaffected
+        by a Y flip). Now apply a +90° symbol rotation in the sexp.
+
+        apply_symbol_transform uses rotate_point(x,y,90) = (-y, x) on
+        already-y-negated coordinates. Applied to the outward direction
+        vector (1, 0) in sch y-down, it produces (0, 1) — i.e. +y in
+        y-down, which is VISUALLY DOWN on screen, = angle 270 in the
+        0=right / 90=up convention.
+
+        Hence the rotation is SUBTRACTED from the screen angle:
+          (0 - 90) mod 360 = 270.
+
+        Regression guard: before the fix this test asserted 90 (the
+        buggy "additive" behaviour), which silently inverted every
+        pin-angle query on any symbol with non-zero rotation. See
+        pin_locator.get_pin_angle's long-form comment for the
+        end-to-end failure mode (Device:R with mirror_x + rotation=90
+        producing a wire stub that threads through the resistor body).
         """
         sym = _stub_symbol("R1", at=[0.0, 0.0, 90.0])
         angle = self._call(sym, {"x": 0.0, "y": 0.0, "angle": 0, "name": "~"})
-        assert angle == 90.0
+        assert angle == 270.0
+
+    def test_mirror_x_combined_with_rotation_90(self):
+        """
+        Regression guard for the combined-transform bug that the original
+        mirror fix missed: a Device:R (pin 1 at lib (0, 3.81) angle 270)
+        placed with BOTH (mirror x) AND rotation=90.
+
+        Geometry: the resistor renders horizontally with its body spanning
+        x = sym_x-2.54 .. sym_x+2.54. pin 1 ends up on the LEFT of the body
+        (at sym_x - 3.81), so its outward direction is LEFT (= 180 in the
+        screen-angle convention).
+
+        Walk-through with the fixed formula:
+          pin_def_angle = 270 (lib)
+          y-negate:                  (360 - 270)   = 90      # was 'up'
+          mirror_x (flip Y direction):  (360 - 90) = 270     # now 'down'
+          subtract rotation 90:        (270 - 90)  = 180     # 'left' ✓
+
+        Cross-checked end-to-end by rendering the same symbol with
+        kicad-cli sch export svg and reading back the pin path — the
+        drawn outward direction matches 180° exactly. See also
+        tests/test_pin_locator_mirror_e2e.py (if present) for the
+        SVG-ground-truth harness.
+        """
+        sym = _stub_symbol_with_mirror("R4", at=[200.0, 50.0, 90.0], mirror_axis="x")
+        angle = self._call(sym, {"x": 0.0, "y": 3.81, "angle": 270, "name": "~"}, pin_number="1")
+        assert angle == 180.0
+
+        # And pin 2 of the same symbol must come out the other side (right = 0°).
+        angle_p2 = self._call(
+            sym, {"x": 0.0, "y": -3.81, "angle": 90, "name": "~"}, pin_number="2"
+        )
+        assert angle_p2 == 0.0
