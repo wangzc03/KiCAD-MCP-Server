@@ -239,9 +239,15 @@ class PinLocator:
 
         Returns:
             (mirror_x, mirror_y): Booleans matching the sexp axis tokens.
-            ``mirror_x`` means the symbol has ``(mirror x)`` which flips the
-            local X axis; ``mirror_y`` flips the local Y axis. This matches
-            the convention already used by ``WireDragger.pin_world_xy``.
+            ``mirror_x`` means the symbol has ``(mirror x)`` — KiCad's
+            sexp convention for "reflect across the X axis", i.e. flip
+            the local **Y** coordinate. Conversely ``mirror_y`` means
+            ``(mirror y)``, i.e. flip the local **X** coordinate.
+
+            The actual coordinate flip is performed by callers (see
+            ``apply_symbol_transform`` for the canonical implementation
+            and ``schematic_analysis._transform_local_point`` for the
+            equivalent upstream helper).
         """
         if not hasattr(target_symbol, "mirror"):
             return False, False
@@ -271,27 +277,39 @@ class PinLocator:
         """
         Transform a pin's local coordinate into world (schematic) coordinates.
 
-        KiCAD applies transforms in the order: mirror (in local space) →
-        rotate → translate. This function is intentionally equivalent to
-        ``WireDragger.pin_world_xy`` so wire dragging and pin location lookup
-        agree on where a pin ends up — which was the root cause of the
-        "mirrored component pin positions are off by a reflection" bug.
+        KiCAD transform order, matching ``schematic_analysis._transform_local_point``
+        and ``wire_connectivity`` inline code:
+
+            negate-y (lib y-up → schematic y-down) → mirror (local) → rotate → translate
+
+        KiCAD sexp semantics for ``(mirror …)``:
+
+            ``(mirror x)`` = reflect across the X axis → **flip Y coordinate**
+            ``(mirror y)`` = reflect across the Y axis → **flip X coordinate**
+
+        NOTE: ``WireDragger.pin_world_xy`` currently implements the *opposite*
+        mirror semantics and omits the y-negate; that is a separate upstream
+        bug scheduled to be fixed in a later release. Do **not** treat
+        ``pin_world_xy`` as the reference implementation.
 
         Args:
-            px, py: Pin position in the library symbol's local frame.
-            sym_x, sym_y: Placed symbol origin in schematic coordinates.
+            px, py: Pin position in the library symbol's local frame
+                (lib_symbols coordinates, y-up).
+            sym_x, sym_y: Placed symbol origin in schematic coordinates (y-down).
             rotation: Symbol rotation in degrees (CCW).
-            mirror_x: True when the symbol has ``(mirror x)`` — flip local X.
-            mirror_y: True when the symbol has ``(mirror y)`` — flip local Y.
+            mirror_x: True when the symbol has ``(mirror x)`` — reflect across
+                the X axis, i.e. flip local **Y**.
+            mirror_y: True when the symbol has ``(mirror y)`` — reflect across
+                the Y axis, i.e. flip local **X**.
 
         Returns:
-            (abs_x, abs_y) in schematic world coordinates.
+            (abs_x, abs_y) in schematic world coordinates (y-down).
         """
-        lx, ly = px, py
+        lx, ly = px, -py
         if mirror_x:
-            lx = -lx
-        if mirror_y:
             ly = -ly
+        if mirror_y:
+            lx = -lx
         rx, ry = PinLocator.rotate_point(lx, ly, rotation)
         # Belt-and-braces rounding: rotate_point now returns exact values
         # for the orthogonal angles, but this guards any future non-
@@ -357,17 +375,20 @@ class PinLocator:
                 else:
                     return None
 
-            # Mirror flips the pin's direction vector in local space before
-            # rotation is applied:
-            #   (mirror x) flips local X → θ becomes (180 - θ)
-            #   (mirror y) flips local Y → θ becomes -θ
-            # Then the placed symbol's rotation is added, giving the absolute
-            # outward direction in schematic coordinates.
+            # Transform order (matches apply_symbol_transform and KiCad sexp):
+            #   lib y-up → schematic y-down      →   θ becomes -θ
+            #   (mirror x) = reflect across X    →   θ becomes -θ     (flip Y)
+            #   (mirror y) = reflect across Y    →   θ becomes 180-θ  (flip X)
+            #   + symbol rotation
+            # Derivation: direction vector (cos θ, sin θ).
+            #   flip Y → (cos θ, -sin θ) = (cos(-θ), sin(-θ)) → θ' = -θ
+            #   flip X → (-cos θ, sin θ) = (cos(180-θ), sin(180-θ)) → θ' = 180-θ
             pin_def_angle = float(pins[pin_number].get("angle", 0))
+            pin_def_angle = (360 - pin_def_angle) % 360
             if mirror_x:
-                pin_def_angle = (180.0 - pin_def_angle) % 360
+                pin_def_angle = (360 - pin_def_angle) % 360
             if mirror_y:
-                pin_def_angle = (-pin_def_angle) % 360
+                pin_def_angle = (180 - pin_def_angle) % 360
             absolute_angle = (pin_def_angle + symbol_rotation) % 360
             return absolute_angle
 
